@@ -16,25 +16,70 @@ def write_file(file_path: str, content: str) -> str:
     except Exception as e:
         return f"Error writing {file_path}: {e}"
 
-def clone_repo(repo_url: str, dest_dir: str, branch: Optional[str] = None) -> str:
+def clone_repo(repo_url: str, dest_dir: str, branch: Optional[str] = None, github_token: Optional[str] = None) -> str:
+    """Clone a repository into dest_dir. If `github_token` is provided, use it for authenticated clone.
+
+    After cloning, ensure the remote `origin` URL is set to the clean `repo_url` (without token) so
+    downstream safety checks that compare origins to the provided URL succeed.
+    """
     os.makedirs(dest_dir, exist_ok=True)
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     local_path = os.path.join(dest_dir, repo_name)
+    # Prepare clone URL (embed token only for the clone operation)
+    clone_url = repo_url
+    if github_token and repo_url.startswith("http"):
+        # Use token in URL for authenticated clone. Use x-access-token prefix to be explicit.
+        # Example: https://x-access-token:TOKEN@github.com/owner/repo.git
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(repo_url)
+            netloc = f"x-access-token:{quote(github_token, safe='')}@{p.hostname}"
+            if p.port:
+                netloc += f":{p.port}"
+            clone_url = urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+        except Exception:
+            # Fallback: naive insertion
+            clone_url = repo_url.replace('https://', f'https://{github_token}@')
+
     if not os.path.exists(local_path):
-        repo = Repo.clone_from(repo_url, local_path)
+        repo = Repo.clone_from(clone_url, local_path)
     else:
         repo = Repo(local_path)
     if branch:
-        repo.git.checkout(branch)
+        try:
+            repo.git.checkout(branch)
+        except Exception:
+            # ignore if branch does not exist locally
+            pass
+
+    # Ensure origin URL is the clean provided repo_url (no token in it)
+    try:
+        origin = repo.remotes.origin
+        clean_url = repo_url.rstrip('/').replace('.git', '')
+        # restore .git if original had it
+        if repo_url.endswith('.git'):
+            clean_url = clean_url + '.git'
+        origin.set_url(clean_url)
+    except Exception:
+        pass
+
     return local_path
 
 class MergeConflictError(RuntimeError):
     pass
 
 
-def create_branch_and_push(repo_path: str, new_branch: str, github_token: Optional[str] = None, files_to_add: list | None = None, commit_message: str | None = None) -> str:
+def create_branch_and_push(repo_path: str, new_branch: str, github_token: Optional[str] = None, files_to_add: list | None = None, commit_message: str | None = None, expected_origin: Optional[str] = None) -> str:
     repo = Repo(repo_path)
     git = repo.git
+
+    # Safety check: verify origin matches expected repo if provided
+    if expected_origin:
+        actual_origin = (repo.remotes.origin.url or "").rstrip("/").replace(".git", "")
+        expected_norm = (expected_origin or "").rstrip("/").replace(".git", "")
+        if actual_origin != expected_norm:
+            raise RuntimeError(f"[Git] ❌ SAFETY CHECK FAILED: Repository origin ({actual_origin}) does not match expected repo ({expected_norm}). Refusing to push.")
+        print(f"[Git] ✅ Safety check passed: origin matches expected repo")
 
     print(f"[Git] Creating branch: {new_branch}")
     # Create or checkout branch
@@ -140,7 +185,10 @@ def create_branch_and_push(repo_path: str, new_branch: str, github_token: Option
     origin = repo.remote(name="origin")
     pushed = False
     
-    print(f"[Git] Attempting to push {new_branch} to origin... (origin url: {getattr(origin, 'url', None)})")
+    print(f"[Git] Attempting to push {new_branch} to origin (configured URL: {getattr(origin, 'url', 'unknown')})")
+    if expected_origin:
+        print(f"[Git] Expected repo: {expected_origin}")
+    
     try:
         origin.push(refspec=f"{new_branch}:{new_branch}", set_upstream=True)
         pushed = True
@@ -149,7 +197,7 @@ def create_branch_and_push(repo_path: str, new_branch: str, github_token: Option
         print(f"[Git] ⚠️ Initial push failed: {e}")
         # Try authenticated push if token provided
         if github_token and getattr(origin, 'url', None) and origin.url.startswith("http"):
-            print(f"[Git] Attempting authenticated push with token...")
+            print(f"[Git] Attempting authenticated push with provided GitHub token...")
             orig_url = origin.url
             try:
                 token_enc = quote(github_token, safe='')
@@ -161,10 +209,14 @@ def create_branch_and_push(repo_path: str, new_branch: str, github_token: Option
                 origin.set_url(urlunparse(authed))
                 repo.git.push("--set-upstream", "origin", new_branch)
                 pushed = True
-                print(f"[Git] ✅ Authenticated push successful!")
-            except Exception as auth_err:
+                print(f"[Git] ✅ Authenticated push with token successful!")
+            except GitCommandError as auth_err:
                 print(f"[Git] ❌ Authenticated push failed: {auth_err}")
-                raise RuntimeError(f"Push with token failed: {auth_err}")
+                # Check if it's a permissions error
+                if "Permission denied" in str(auth_err) or "authentication failed" in str(auth_err).lower():
+                    raise RuntimeError(f"Push failed: Token does not have permission to push. Ensure token has 'repo' and 'pull_requests:write' scopes.")
+                else:
+                    raise RuntimeError(f"Push with token failed: {auth_err}")
             finally:
                 try:
                     origin.set_url(orig_url)

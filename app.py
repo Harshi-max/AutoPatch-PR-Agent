@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import io
+import os
 import queue
 import re
 import threading
@@ -36,8 +37,70 @@ st.write("AI-powered bot to auto-fix code style issues, create PRs, and optional
 with st.sidebar:
     st.header("Configuration")
     repo_url = st.text_input("GitHub repository URL", help="e.g. https://github.com/owner/repo.git")
-    gh_token = st.text_input("GitHub token (PAT)", type="password")
+    
+    # Validate repo URL format
+    def validate_repo_url(url):
+        if not url:
+            return False, "Repository URL is required"
+        if "github.com" not in url.lower():
+            return False, "Must be a GitHub repository URL"
+        if not (".git" in url or "/" in url.split("github.com")[-1]):
+            return False, "Invalid GitHub URL format"
+        return True, "Valid GitHub URL"
+    
+    if repo_url:
+        is_valid, validation_msg = validate_repo_url(repo_url)
+        if is_valid:
+            st.success(f"✅ {validation_msg}")
+        else:
+            st.error(f"❌ {validation_msg}")
+    
+    gh_token = st.text_input("GitHub token (PAT)", type="password", help="Must have repo, issues:write, and pull_requests:write scopes")
+    
+    if gh_token:
+        token_preview = "●" * max(0, len(gh_token) - 4) + gh_token[-4:] if len(gh_token) > 4 else "●" * len(gh_token)
+        st.caption(f"🔐 Token: {token_preview}")
+    
     base_branch = st.text_input("Base branch", value="main")
+
+    # Legacy: expose converted notebook agents as sidebar utilities
+    with st.expander("📔 Notebook-based Agents (Legacy)"):
+        st.write("Run legacy notebook agents (converted to Python modules). These run the same logic as the .ipynb but in-process.")
+        nb_repo = st.text_input("Notebook agent repo URL", value=repo_url or "", help="Repo to use for notebook agents")
+        nb_token = st.text_input("Notebook agent token (optional)", type="password", value="", help="Optional token; falls back to main token if empty")
+        if st.button("Run: Clone (notebook agent)", key="nb_clone_btn"):
+            try:
+                from agents import notebook_agents as nb
+                repo_to_use = nb_repo.strip() or repo_url
+                token_to_use = nb_token.strip() or gh_token
+                res = nb.clone_repository(repo_to_use, token_to_use, branch=base_branch)
+                st.success(str(res))
+            except Exception as e:
+                st.error(f"Notebook agent clone failed: {e}")
+
+        if st.button("Run: Lint & Store (notebook agent)", key="nb_lint_btn"):
+            try:
+                from agents import notebook_agents as nb
+                repo_to_use = nb_repo.strip() or repo_url
+                token_to_use = nb_token.strip() or gh_token
+                local_path = nb.clone_repository(repo_to_use, token_to_use, branch=base_branch)
+                if os.path.isdir(local_path):
+                    report = nb.run_linter_and_store(local_path)
+                    st.write(report)
+                else:
+                    st.error(f"Clone did not produce a repo path: {local_path}")
+            except Exception as e:
+                st.error(f"Notebook agent lint failed: {e}")
+
+        if st.button("Show Notebook Artifacts", key="nb_art_btn"):
+            try:
+                from agents import notebook_agents as nb
+                keys = list(nb.ARTIFACT_STORE.keys())
+                st.write("Artifacts:", keys)
+                for k in keys:
+                    st.write(k, nb.ARTIFACT_STORE.get(k, {}).get("count"))
+            except Exception as e:
+                st.error(f"Failed to read artifacts: {e}")
 
     st.subheader("Feature Toggles")
     enable_security = st.checkbox("Enable security linting (Bandit)", value=False)
@@ -58,7 +121,38 @@ with st.sidebar:
     
     if pr_requirement:
         st.info(f"🎯 Patcher will auto-generate code to: {pr_requirement[:60]}...")
-
+    
+    # Display configuration summary
+    st.subheader("📋 Configuration Summary")
+    with st.container(border=True):
+        if repo_url:
+            st.write(f"**Repository:** `{repo_url}`")
+        else:
+            st.warning("Repository URL not configured")
+        
+        if gh_token:
+            st.write(f"**Token Scope:** Required: `repo`, `issues:write`, `pull_requests:write`")
+            st.caption("✓ Token is masked for security")
+        else:
+            st.warning("GitHub token not configured")
+        
+        st.write(f"**Base Branch:** `{base_branch}`")
+    
+    # Token scope information
+    with st.expander("ℹ️ Token Scope Requirements"):
+        st.markdown("""
+        Your GitHub token must have these scopes:
+        - **repo** - Full control of private repositories
+        - **issues:write** - Write access to issues and pull requests
+        - **pull_requests:write** - Write access to pull requests
+        
+        To create a token:
+        1. Go to GitHub Settings → Developer Settings → Personal Access Tokens
+        2. Click "Generate new token"
+        3. Select the above scopes
+        4. Copy and paste the token here
+        """)
+    
     run_now = st.button("🚀 Run Patcher", key="run_button", use_container_width=True)
 
 
@@ -192,303 +286,322 @@ def create_security_issues_bar(bandit_report_id: str):
 
 
 if run_now:
+    # Validate inputs before running
     if not repo_url:
         st.error("❌ Please provide a GitHub repository URL.")
     elif not gh_token:
         st.error("❌ Please provide a GitHub token (PAT).")
     else:
-        log_q: "queue.Queue[str]" = queue.Queue()
-        event_q: "queue.Queue[tuple]" = queue.Queue()
+        # Validate repo URL format
+        is_valid, validation_msg = validate_repo_url(repo_url)
+        if not is_valid:
+            st.error(f"❌ Invalid repository URL: {validation_msg}")
+        else:
+            log_q: "queue.Queue[str]" = queue.Queue()
+            event_q: "queue.Queue[tuple]" = queue.Queue()
 
-        # Stage definitions with emojis
-        stage_emojis = {
-            "clone": "📦", "scan": "🔍", "lint": "✨", "analyze": "📊",
-            "security": "🔒", "semantic": "🧠", "confidence": "📈",
-            "generate": "💡", "fix": "🔧", "apply": "✅", "commit": "📝",
-            "push": "⬆️", "publish": "🚀", "pr": "🔀", "prreview": "👀", "ci": "⚙️"
-        }
+            # Stage definitions with emojis
+            stage_emojis = {
+                "clone": "📦", "scan": "🔍", "lint": "✨", "analyze": "📊",
+                "security": "🔒", "semantic": "🧠", "confidence": "📈",
+                "generate": "💡", "fix": "🔧", "apply": "✅", "commit": "📝",
+                "push": "⬆️", "publish": "🚀", "pr": "🔀", "prreview": "👀", "ci": "⚙️"
+            }
 
-        # Initialize stage status tracking
-        stage_statuses = {
-            "clone": "pending", "scan": "pending", "lint": "pending", "analyze": "pending",
-            "security": "pending", "semantic": "pending", "confidence": "pending",
-            "generate": "pending", "fix": "pending", "apply": "pending",
-            "commit": "pending", "push": "pending", "publish": "pending",
-            "pr": "pending", "prreview": "pending", "ci": "pending"
-        }
+            # Initialize stage status tracking
+            stage_statuses = {
+                "clone": "pending", "scan": "pending", "lint": "pending", "analyze": "pending",
+                "security": "pending", "semantic": "pending", "confidence": "pending",
+                "generate": "pending", "fix": "pending", "apply": "pending",
+                "commit": "pending", "push": "pending", "publish": "pending",
+                "pr": "pending", "prreview": "pending", "ci": "pending"
+                }
 
-        # Create layout: main area + right sidebar
-        col1, col2 = st.columns([2, 1])
+            # Create layout: main area + right sidebar
+            col1, col2 = st.columns([2, 1])
 
-        with col2:
-            st.subheader("📊 Status Overview")
-            status_pie = st.empty()
-            metrics_area = st.empty()
+            with col2:
+                st.subheader("📊 Status Overview")
+                status_pie = st.empty()
+                metrics_area = st.empty()
 
-        with col1:
-            st.subheader("🔄 Pipeline Progress")
+            with col1:
+                st.subheader("🔄 Pipeline Progress")
 
-            # Stage boxes grid
-            stage_grid = st.columns(4)
-            stage_boxes = {}
-            for idx, (stage_name, emoji) in enumerate(stage_emojis.items()):
-                col = stage_grid[idx % 4]
-                stage_boxes[stage_name] = col.empty()
+                # Stage boxes grid
+                stage_grid = st.columns(4)
+                stage_boxes = {}
+                for idx, (stage_name, emoji) in enumerate(stage_emojis.items()):
+                    col = stage_grid[idx % 4]
+                    stage_boxes[stage_name] = col.empty()
 
-            # Logs section
-            st.subheader("📋 Execution Logs")
-            log_container = st.empty()
-            log_text = ""
+                # Logs section
+                st.subheader("📋 Execution Logs")
+                log_container = st.empty()
+                log_text = ""
 
-            # Issue visualizations
-            issues_col1, issues_col2 = st.columns(2)
-            issues_graph = issues_col1.empty()
-            security_graph = issues_col2.empty()
+                # Issue visualizations
+                issues_col1, issues_col2 = st.columns(2)
+                issues_graph = issues_col1.empty()
+                security_graph = issues_col2.empty()
 
-            # Artifact details
-            st.subheader("📦 Artifacts")
-            artifact_container = st.empty()
+                # Artifact details
+                st.subheader("📦 Artifacts")
+                artifact_container = st.empty()
 
-            report_id = None
-            bandit_report_id = None
+                report_id = None
+                bandit_report_id = None
 
-        # Start background thread
-        t = threading.Thread(
-            target=_run_pipeline_background,
-            args=(
-                repo_url.strip(),
-                gh_token.strip(),
-                base_branch.strip() or None,
-                log_q,
-                event_q,
-                enable_security,
-                enable_pr_review,
-                enable_ci,
-                enable_confidence,
-                enable_semantic,
-                True,  # Always auto-create PR
-                pr_requirement if pr_requirement else None,  # Pass PR requirement if provided
-            ),
-            daemon=True,
-        )
-        t.start()
+            # Start background thread
+            t = threading.Thread(
+                target=_run_pipeline_background,
+                args=(
+                    repo_url.strip(),
+                    gh_token.strip(),
+                    base_branch.strip() or None,
+                    log_q,
+                    event_q,
+                    enable_security,
+                    enable_pr_review,
+                    enable_ci,
+                    enable_confidence,
+                    enable_semantic,
+                    True,  # Always auto-create PR
+                    pr_requirement if pr_requirement else None,  # Pass PR requirement if provided
+                ),
+                daemon=True,
+            )
+            t.start()
 
-        with st.spinner("🔄 Running agents — streaming logs below..."):
-            while t.is_alive() or not log_q.empty() or not event_q.empty():
-                try:
-                    # Process events
-                    while not event_q.empty():
-                        stage, info = event_q.get_nowait()
-
-                        if stage == "clone:start":
-                            stage_statuses["clone"] = "running"
-                        elif stage == "clone:done":
-                            stage_statuses["clone"] = "success"
-                        elif stage == "requirement:start":
-                            # When requirement-driven, map requirement stage to scan/lint
-                            stage_statuses["scan"] = "running"
-                            stage_statuses["lint"] = "running"
-                        elif stage == "requirement:done":
-                            stage_statuses["scan"] = "success"
-                            stage_statuses["lint"] = "success"
-                            st.session_state['pr_requirement'] = info
-                        elif stage == "scan:start":
-                            stage_statuses["scan"] = "running"
-                        elif stage == "scan:done":
-                            stage_statuses["scan"] = "success"
-                        elif stage == "lint:start":
-                            stage_statuses["lint"] = "running"
-                        elif stage == "lint:done":
-                            stage_statuses["lint"] = "success"
-                        elif stage == "analyze:start":
-                            stage_statuses["analyze"] = "running"
-                        elif stage == "analyze:done":
-                            stage_statuses["analyze"] = "success"
-                            # Extract report ID from info
-                            match = re.search(r"Reference ID: ([a-f0-9\-]{36})", str(info))
-                            if match:
-                                report_id = match.group(1)
-                        elif stage == "security:start":
-                            stage_statuses["security"] = "running"
-                        elif stage == "security:done":
-                            stage_statuses["security"] = "success"
-                            bandit_report_id = info
-                        elif stage == "security:error":
-                            stage_statuses["security"] = "error"
-                        elif stage == "semantic:start":
-                            stage_statuses["semantic"] = "running"
-                        elif stage == "semantic:done":
-                            stage_statuses["semantic"] = "success"
-                        elif stage == "confidence:start":
-                            stage_statuses["confidence"] = "running"
-                        elif stage == "confidence:done":
-                            stage_statuses["confidence"] = "success"
-                        elif stage == "generate:start":
-                            stage_statuses["generate"] = "running"
-                        elif stage == "generate:done":
-                            stage_statuses["generate"] = "success"
-                        elif stage == "fix:start":
-                            stage_statuses["fix"] = "running"
-                        elif stage == "fix:done":
-                            stage_statuses["fix"] = "success"
-                        elif stage == "fix:error":
-                            stage_statuses["fix"] = "error"
-                        elif stage == "apply:done":
-                            stage_statuses["apply"] = "success"
-                        elif stage == "commit:start":
-                            stage_statuses["commit"] = "running"
-                        elif stage == "commit:done":
-                            stage_statuses["commit"] = "success"
-                        elif stage == "commit:error":
-                            stage_statuses["commit"] = "error"
-                        elif stage == "push:start":
-                            stage_statuses["push"] = "running"
-                        elif stage == "push:done":
-                            stage_statuses["push"] = "success"
-                        elif stage == "push:conflict":
-                            stage_statuses["push"] = "error"
-                        elif stage == "push:error":
-                            stage_statuses["push"] = "error"
-                        elif stage == "publish:start":
-                            stage_statuses["publish"] = "running"
-                        elif stage == "publish:done":
-                            stage_statuses["publish"] = "success"
-                        elif stage == "publish:error":
-                            stage_statuses["publish"] = "error"
-                        elif stage == "pr:created":
-                            stage_statuses["pr"] = "success"
-                            st.session_state['pipeline_result'] = {"pr_url": info}
-                        elif stage == "pr:pending":
-                            stage_statuses["pr"] = "pending"
-                            st.session_state['pr_pending'] = True
-                        elif stage == "pr:error":
-                            stage_statuses["pr"] = "error"
-                        elif stage == "prreview:start":
-                            stage_statuses["prreview"] = "running"
-                        elif stage == "prreview:done":
-                            stage_statuses["prreview"] = "success"
-                        elif stage == "prreview:pending":
-                            stage_statuses["prreview"] = "pending"
-                        elif stage == "prreview:error":
-                            stage_statuses["prreview"] = "error"
-                        elif stage == "ci:start":
-                            stage_statuses["ci"] = "running"
-                        elif stage == "ci:done":
-                            stage_statuses["ci"] = "success"
-                        elif stage == "ci:error":
-                            stage_statuses["ci"] = "error"
-                        elif stage == "confidence:start":
-                            stage_statuses["confidence"] = "running"
-                        elif stage == "confidence:done":
-                            stage_statuses["confidence"] = "success"
-                        elif stage == "confidence:error":
-                            stage_statuses["confidence"] = "error"
-                        elif stage == "semantic:start":
-                            stage_statuses["semantic"] = "running"
-                        elif stage == "semantic:done":
-                            stage_statuses["semantic"] = "success"
-                        elif stage == "security:start":
-                            stage_statuses["security"] = "running"
-                        elif stage == "security:done":
-                            stage_statuses["security"] = "success"
-                            bandit_report_id = info
-                        elif stage == "security:error":
-                            stage_statuses["security"] = "error"
-                        elif stage == "result":
-                            # Orchestrator returned result dict
-                            try:
-                                res = info
-                                st.session_state['pipeline_result'] = res
-                                if res and res.get('branch'):
-                                    st.session_state['pr_pending'] = True
-                            except Exception:
-                                pass
-                        elif stage == "error":
-                            st.error(f"❌ Pipeline error: {info}")
-
-                    # Render stage boxes
-                    for stage_name, status in stage_statuses.items():
-                        emoji = stage_emojis.get(stage_name, "")
-                        color_map = {"success": "✅", "pending": "⏳", "running": "🔄", "error": "❌"}
-                        status_icon = color_map.get(status, "")
-                        stage_boxes[stage_name].info(f"{emoji} {stage_name.title()}\n{status_icon} {status.upper()}")
-
-                    # Update pie chart
+            with st.spinner("🔄 Running agents — streaming logs below..."):
+                while t.is_alive() or not log_q.empty() or not event_q.empty():
                     try:
-                        fig = create_stage_status_pie(stage_statuses)
-                        status_pie.plotly_chart(fig, use_container_width=True)
-                    except Exception:
-                        pass
+                        # Process events
+                        while not event_q.empty():
+                            stage, info = event_q.get_nowait()
 
-                    # Update metrics
-                    try:
-                        completed = sum(1 for s in stage_statuses.values() if s == "success")
-                        total = len(stage_statuses)
-                        with metrics_area.container():
-                            col1, col2 = st.columns(2)
-                            col1.metric("Completed", f"{completed}/{total}")
-                            col2.metric("Progress", f"{int(100*completed/total)}%")
-                    except Exception:
-                        pass
+                            if stage == "clone:start":
+                                stage_statuses["clone"] = "running"
+                            elif stage == "clone:done":
+                                stage_statuses["clone"] = "success"
+                            elif stage == "requirement:start":
+                                # When requirement-driven, map requirement stage to scan/lint
+                                stage_statuses["scan"] = "running"
+                                stage_statuses["lint"] = "running"
+                            elif stage == "requirement:done":
+                                stage_statuses["scan"] = "success"
+                                stage_statuses["lint"] = "success"
+                                st.session_state['pr_requirement'] = info
+                            elif stage == "scan:start":
+                                stage_statuses["scan"] = "running"
+                            elif stage == "scan:done":
+                                stage_statuses["scan"] = "success"
+                            elif stage == "lint:start":
+                                stage_statuses["lint"] = "running"
+                            elif stage == "lint:done":
+                                stage_statuses["lint"] = "success"
+                            elif stage == "analyze:start":
+                                stage_statuses["analyze"] = "running"
+                            elif stage == "analyze:done":
+                                stage_statuses["analyze"] = "success"
+                                # Extract report ID from info
+                                match = re.search(r"Reference ID: ([a-f0-9\-]{36})", str(info))
+                                if match:
+                                    report_id = match.group(1)
+                            elif stage == "security:start":
+                                stage_statuses["security"] = "running"
+                            elif stage == "security:done":
+                                stage_statuses["security"] = "success"
+                                bandit_report_id = info
+                            elif stage == "security:error":
+                                stage_statuses["security"] = "error"
+                            elif stage == "semantic:start":
+                                stage_statuses["semantic"] = "running"
+                            elif stage == "semantic:done":
+                                stage_statuses["semantic"] = "success"
+                            elif stage == "confidence:start":
+                                stage_statuses["confidence"] = "running"
+                            elif stage == "confidence:done":
+                                stage_statuses["confidence"] = "success"
+                            elif stage == "generate:start":
+                                stage_statuses["generate"] = "running"
+                            elif stage == "generate:done":
+                                stage_statuses["generate"] = "success"
+                            elif stage == "fix:start":
+                                stage_statuses["fix"] = "running"
+                            elif stage == "fix:done":
+                                stage_statuses["fix"] = "success"
+                            elif stage == "fix:error":
+                                stage_statuses["fix"] = "error"
+                            elif stage == "apply:done":
+                                stage_statuses["apply"] = "success"
+                            elif stage == "commit:start":
+                                stage_statuses["commit"] = "running"
+                            elif stage == "commit:done":
+                                stage_statuses["commit"] = "success"
+                            elif stage == "commit:error":
+                                stage_statuses["commit"] = "error"
+                            elif stage == "push:start":
+                                stage_statuses["push"] = "running"
+                            elif stage == "push:done":
+                                stage_statuses["push"] = "success"
+                            elif stage == "push:conflict":
+                                stage_statuses["push"] = "error"
+                            elif stage == "push:error":
+                                stage_statuses["push"] = "error"
+                            elif stage == "publish:start":
+                                stage_statuses["publish"] = "running"
+                            elif stage == "publish:done":
+                                stage_statuses["publish"] = "success"
+                            elif stage == "publish:error":
+                                stage_statuses["publish"] = "error"
+                            elif stage == "pr:created":
+                                stage_statuses["pr"] = "success"
+                                st.session_state['pipeline_result'] = {"pr_url": info}
+                            elif stage == "pr:pending":
+                                stage_statuses["pr"] = "pending"
+                                st.session_state['pr_pending'] = True
+                            elif stage == "pr:error":
+                                stage_statuses["pr"] = "error"
+                            elif stage == "prreview:start":
+                                stage_statuses["prreview"] = "running"
+                            elif stage == "prreview:done":
+                                stage_statuses["prreview"] = "success"
+                            elif stage == "prreview:pending":
+                                stage_statuses["prreview"] = "pending"
+                            elif stage == "prreview:error":
+                                stage_statuses["prreview"] = "error"
+                            elif stage == "ci:start":
+                                stage_statuses["ci"] = "running"
+                            elif stage == "ci:done":
+                                stage_statuses["ci"] = "success"
+                            elif stage == "ci:error":
+                                stage_statuses["ci"] = "error"
+                            elif stage == "confidence:start":
+                                stage_statuses["confidence"] = "running"
+                            elif stage == "confidence:done":
+                                stage_statuses["confidence"] = "success"
+                            elif stage == "confidence:error":
+                                stage_statuses["confidence"] = "error"
+                            elif stage == "semantic:start":
+                                stage_statuses["semantic"] = "running"
+                            elif stage == "semantic:done":
+                                stage_statuses["semantic"] = "success"
+                            elif stage == "security:start":
+                                stage_statuses["security"] = "running"
+                            elif stage == "security:done":
+                                stage_statuses["security"] = "success"
+                                bandit_report_id = info
+                            elif stage == "security:error":
+                                stage_statuses["security"] = "error"
+                            elif stage == "result":
+                                # Orchestrator returned result dict
+                                try:
+                                    res = info
+                                    st.session_state['pipeline_result'] = res
+                                    if res and res.get('branch'):
+                                        st.session_state['pr_pending'] = True
+                                except Exception:
+                                    pass
+                            elif stage == "error":
+                                st.error(f"❌ Pipeline error: {info}")
 
-                    # Update issue graphs
-                    if report_id:
+                        # Render stage boxes
+                        for stage_name, status in stage_statuses.items():
+                            emoji = stage_emojis.get(stage_name, "")
+                            color_map = {"success": "✅", "pending": "⏳", "running": "🔄", "error": "❌"}
+                            status_icon = color_map.get(status, "")
+                            stage_boxes[stage_name].info(f"{emoji} {stage_name.title()}\n{status_icon} {status.upper()}")
+
+                        # Update pie chart
                         try:
-                            fig = create_issues_bar(report_id)
-                            if fig:
-                                issues_graph.plotly_chart(fig, use_container_width=True)
+                            fig = create_stage_status_pie(stage_statuses)
+                            status_pie.plotly_chart(fig, use_container_width=True)
                         except Exception:
                             pass
 
-                    if bandit_report_id:
+                        # Update metrics
                         try:
-                            fig = create_security_issues_bar(bandit_report_id)
-                            if fig:
-                                security_graph.plotly_chart(fig, use_container_width=True)
+                            completed = sum(1 for s in stage_statuses.values() if s == "success")
+                            total = len(stage_statuses)
+                            with metrics_area.container():
+                                col1, col2 = st.columns(2)
+                                col1.metric("Completed", f"{completed}/{total}")
+                                col2.metric("Progress", f"{int(100*completed/total)}%")
                         except Exception:
                             pass
 
-                    # Update artifact summary
-                    try:
-                        artifact_text = ""
-                        if report_id:
-                            art = get_artifact(report_id)
-                            if art:
-                                artifact_text += f"**Ruff Issues:** {art.get('count', 0)} found\n\n"
-                        if bandit_report_id:
-                            art = get_artifact(bandit_report_id)
-                            if art:
-                                artifact_text += f"**Security Issues:** {art.get('count', 0)} found\n\n"
-                        if artifact_text:
-                            artifact_container.markdown(artifact_text)
-                    except Exception:
-                        pass
+                        # Update issue graphs
+                        try:
+                            if report_id:
+                                fig = create_issues_bar(report_id)
+                                if fig:
+                                    issues_graph.plotly_chart(fig, use_container_width=True)
+                        except Exception:
+                            pass
 
-                    # Append logs
-                    appended = False
-                    while not log_q.empty():
-                        chunk = log_q.get_nowait()
-                        log_text += str(chunk)
-                        appended = True
+                        try:
+                            if bandit_report_id:
+                                fig = create_security_issues_bar(bandit_report_id)
+                                if fig:
+                                    security_graph.plotly_chart(fig, use_container_width=True)
+                        except Exception:
+                            pass
 
-                    if appended:
-                        log_container.code(log_text, language="log")
+                        # Update artifact summary
+                        try:
+                            artifact_text = ""
+                            if report_id:
+                                art = get_artifact(report_id)
+                                if art:
+                                    artifact_text += f"**Ruff Issues:** {art.get('count', 0)} found\n\n"
+                            if bandit_report_id:
+                                art = get_artifact(bandit_report_id)
+                                if art:
+                                    artifact_text += f"**Security Issues:** {art.get('count', 0)} found\n\n"
+                            if artifact_text:
+                                artifact_container.markdown(artifact_text)
+                        except Exception:
+                            pass
 
-                except Exception:
-                    pass
+                        # Append logs
+                        appended = False
+                        while not log_q.empty():
+                            chunk = log_q.get_nowait()
+                            log_text += str(chunk)
+                            appended = True
 
-                time.sleep(0.2)
+                        if appended:
+                            log_container.code(log_text, language="log")
 
-        st.success("✅ Pipeline completed!")
-        log_container.code(log_text, language="log")
+                        time.sleep(0.2)
 
-        # Display PR link if auto-created
-        res = st.session_state.get('pipeline_result')
-        if res and res.get('pr_url'):
+                    except Exception as e:
+                        st.error(f"❌ Error during pipeline: {str(e)}")
+
+            st.success("✅ Pipeline completed!")
+            log_container.code(log_text, language="log")
+
+            # Display configuration used
             st.markdown("---")
-            st.success(f"✅ Pull Request Created by Patcher!")
-            st.markdown(f"### [🔀 View PR on GitHub]({res.get('pr_url')})")
-            st.info(f"**Branch:** `{res.get('branch')}`\n\n**PR URL:** {res.get('pr_url')}\n\n**Bot Author:** Patcher AI")
+            st.subheader("📋 Execution Configuration")
+            with st.container(border=True):
+                cols = st.columns([1, 1, 1])
+                with cols[0]:
+                    st.metric("Repository", repo_url.split('/')[-1].replace('.git', ''))
+                with cols[1]:
+                    st.metric("Base Branch", base_branch)
+                with cols[2]:
+                    token_last_chars = gh_token[-4:] if len(gh_token) > 4 else "***"
+                    st.metric("Token", f"...{token_last_chars} ✓")
+
+            # Display PR link if auto-created
+            res = st.session_state.get('pipeline_result')
+            if res and res.get('pr_url'):
+                st.markdown("---")
+                st.success(f"✅ Pull Request Created by Patcher!")
+                st.markdown(f"### [🔀 View PR on GitHub]({res.get('pr_url')})")
+                st.info(f"**Branch:** `{res.get('branch')}`\n\n**PR URL:** {res.get('pr_url')}\n\n**Bot Author:** Patcher AI")
 
 st.markdown("---")
 st.subheader("🔍 PR Auto-Review (Patcher)")
@@ -509,31 +622,23 @@ if review_button:
     else:
         st.info(f"🔄 Patcher is reviewing PR #{int(pr_number_input)}...")
         try:
-            from agents.publish_agent import post_pr_comment
+            from agents.publish_agent import generate_pr_review_comment, post_pr_comment
             # Extract owner/repo from URL
             clean_url = repo_url.rstrip("/").replace(".git", "")
             owner_repo = clean_url.split("github.com/")[-1]
             pr_url = f"https://github.com/{owner_repo}/pull/{int(pr_number_input)}"
-            
-            # Post auto-review comment
-            review_comment = f"""🤖 **Automated Review by Patcher**
 
-This PR has been reviewed by the Patcher bot. Here are the recommended fixes:
+            # Generate a dynamic AI-based review comment (falls back to heuristic if LLM not available)
+            try:
+                comment_body = asyncio.run(generate_pr_review_comment(None, "ui-session", pr_url, repo_url, gh_token.strip()))
+            except Exception:
+                # Fallback to brief heuristic if the async generator fails
+                comment_body = (
+                    f"Automated review by Patcher: Could not generate detailed AI review.\n"
+                    f"Please inspect PR #{int(pr_number_input)} at {pr_url}."
+                )
 
-**Analysis:**
-- ✅ Style checking complete
-- ✅ Security scanning complete  
-- ✅ Code quality analysis complete
-
-**Recommendations:**
-- Review the auto-generated fixes in the linked branch
-- Run tests to ensure all changes are compatible
-- Merge when ready
-
----
-*Reviewed by Patcher AI on {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} UTC*
-"""
-            post_pr_comment(pr_url, review_comment, gh_token.strip())
+            post_pr_comment(pr_url, comment_body, gh_token.strip())
             st.success(f"✅ Patcher has reviewed PR #{int(pr_number_input)} and posted comments!")
             st.markdown(f"### [View PR with Patcher Comments →]({pr_url})")
         except PermissionError as e:
@@ -555,6 +660,24 @@ This PR has been reviewed by the Patcher bot. Here are the recommended fixes:
         except Exception as e:
             st.error(f"❌ Review failed: {str(e)}")
             st.info("Make sure the PR number is valid and your GitHub token has access to the repository.")
+
+st.markdown("---")
+st.subheader("📔 Notebook-based Agents (Legacy)")
+st.write("Alternative agent system extracted from Jupyter Notebook for repository analysis and PR creation.")
+
+with st.expander("📋 View Notebook Agents Features", expanded=False):
+    st.write("""
+    These agents provide an alternative multi-agent approach:
+    
+    - **RepoCloner**: Clones GitHub repositories locally with branch support
+    - **Analyzer**: Runs Ruff linter and stores issues with unique reference IDs
+    - **Fixer**: Updates files based on linting issues
+    - **Publisher**: Creates GitHub pull requests with auto-generated branches
+    
+    **Import:** Use `from agents.notebook_agents import clone_repository, run_linter_and_store, create_github_pr`
+    """)
+
+    st.info(f"📂 **Location**: `agents/notebook_agents.py` ({os.path.getsize('agents/notebook_agents.py')} bytes)")
 
 st.markdown("---")
 st.markdown("**Patcher Bot** | Built to autofix code style and create PRs | Review Mode Available")

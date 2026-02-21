@@ -50,11 +50,55 @@ async def run_pipeline(
                 progress_callback(stage, info)
         except Exception:
             pass
+    # track emitted stages so we can auto-finalize missing ones at the end
+    emitted_stages = set()
+    def _emit(stage: str, info: str | None = None):
+        emitted_stages.add(stage)
+        emit(stage, info)
 
     ensure_dir(TEMP_REPOS_DIR)
-    emit("clone:start")
-    local_path = clone_repo(repo_url, TEMP_REPOS_DIR, base_branch or None)
-    emit("clone:done", local_path)
+
+    # If a token is provided, validate token and possibly fork if push access is missing.
+    try:
+        owner_repo = _parse_github_owner_repo(repo_url)
+        if gh_token and owner_repo:
+            owner, repo_name = owner_repo
+            headers = {"Authorization": f"token {gh_token}", "Accept": "application/vnd.github+json"}
+            # get authenticated user
+            try:
+                uresp = requests.get("https://api.github.com/user", headers=headers, timeout=10)
+                if uresp.status_code == 200:
+                    auth_user = uresp.json().get('login')
+                else:
+                    auth_user = None
+            except Exception:
+                auth_user = None
+
+            # check repo permissions
+            try:
+                rmeta = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}", headers=headers, timeout=10)
+                if rmeta.status_code == 200:
+                    perms = rmeta.json().get('permissions', {})
+                    if not perms.get('push', False) and auth_user:
+                        # create a fork to allow pushing
+                        _emit('fork:start', f'Creating fork for user {auth_user}')
+                        fk = requests.post(f"https://api.github.com/repos/{owner}/{repo_name}/forks", headers=headers, timeout=10)
+                        if fk.status_code in (202, 201):
+                            fork_url = f"https://github.com/{auth_user}/{repo_name}.git"
+                            repo_url = fork_url
+                            _emit('fork:created', fork_url)
+                        else:
+                            _emit('fork:error', fk.text[:200])
+                # else: ignore API error and continue with provided repo_url
+            except Exception as e:
+                _emit('fork:error', str(e))
+
+    except Exception:
+        pass
+
+    _emit("clone:start")
+    local_path = clone_repo(repo_url, TEMP_REPOS_DIR, base_branch or None, github_token=gh_token)
+    _emit("clone:done", local_path)
 
     # Initialize runners (needed for both requirement-driven and analysis-driven modes)
     session_service = build_session_service()
@@ -63,58 +107,65 @@ async def run_pipeline(
     runner_fix = Runner(model="models/gemini-2.0-flash", app= "auto-patch-pr-agent", session_service=session_service)
 
     # Requirement analysis (if provided)
-    if pr_requirement:
-        emit("requirement:start", f"Processing requirement: {pr_requirement[:60]}...")
-        print(f"\n[Requirements] User requirement: {pr_requirement}")
-        # Create an artifact entry (empty issues) so downstream stages have a valid report id
-        report_id = store_issues([], local_path)
-        analysis_output = f"Requirement: {pr_requirement}\nReference ID: {report_id}"
-        emit("requirement:done", pr_requirement)
-    else:
-        # Normal scan / lint
-        emit("scan:start")
-        emit("lint:start")
+    if pr_review_comments:
+        try:
+            if not pr_url:
+                print("[Publisher] ❌ Cannot post PR review - no PR created")
+                _emit("prreview:error", "Cannot review PR - PR creation failed")
+            else:
+                print("[Patcher] Generating AI-based review comment...")
+                try:
+                    from agents.publish_agent import generate_pr_review_comment
+                    # prefer the analyze runner if available
+                    runner_to_use = locals().get('runner_analyze') or locals().get('runner_fix')
+                    session_id_local = session_id
+                    comment_body = await generate_pr_review_comment(runner_to_use, session_id_local, pr_url, repo_url, gh_token)
+                except Exception as gen_err:
+                    print(f"[Patcher] Review generation failed, falling back: {gen_err}")
+                    comment_body = "Automated review: could not generate AI review; please inspect changes manually."
 
-        # Analyze
-        emit("analyze:start")
-        print("\n[Analyzer]: Analyzing...")
-        analysis_output = analyze_repo_for_issues(local_path)
-        print("Analysis:", analysis_output)
-        emit("analyze:done", analysis_output)
-        emit("lint:done", analysis_output)
-        emit("scan:done", local_path)
-        report_id = None
-
-    # Optional security linting
-    # Security linting (Bandit)
-    bandit_report_id = None
-    if security_lint:
-        emit("security:start", "Running Bandit security scan")
+                post_pr_comment(pr_url, comment_body, gh_token)
+                print(f"[Patcher] Review comment posted")
+                _emit("prreview:done", pr_url)
+        except Exception as e:
+            error_msg = f"Failed to post review comment: {str(e)}"
+            print(f"[Patcher] PR review failed: {error_msg}")
+            _emit("prreview:error", error_msg)
         try:
             bandit_report_id = run_bandit_on_path(local_path)
-            emit("security:done", bandit_report_id)
+            _emit("security:done", bandit_report_id)
         except Exception as e:
             emit("security:error", str(e))
 
     # Optional deeper semantic refactoring
     if semantic_refactor:
-        emit("semantic:start")
+        _emit("semantic:start")
         sem_out = run_semantic_refactor(local_path)
-        emit("semantic:done", sem_out)
+        _emit("semantic:done", sem_out)
 
     # Optional patch confidence scoring (computed after fixes)
     # We'll compute later after fixes run
 
     match = re.search(r"([a-f0-9\-]{36})", analysis_output)
     if not match:
-        print("No Reference ID returned.")
-        return {"status": "failed", "reason": "no_analysis_report"}
-    report_id = match.group(1)
-    print(f"Artifact ID: {report_id}")
+        # If analysis output did not include a reference ID, create a fallback empty report
+        print("Warning: No Reference ID returned from analysis. Creating empty artifact to continue pipeline.")
+        try:
+            from core.artifacts import store_issues as _store
+            fallback_id = _store([], local_path)
+            report_id = fallback_id
+            _emit("analyze:warning", f"No report id found; created fallback id {report_id}")
+            print(f"Artifact fallback ID: {report_id}")
+        except Exception as e:
+            print(f"Failed to create fallback artifact: {e}")
+            return {"status": "failed", "reason": "no_analysis_report", "detail": str(e)}
+    else:
+        report_id = match.group(1)
+        print(f"Artifact ID: {report_id}")
 
     # Fix / Generate code
-    emit("generate:start", report_id)
-    emit("fix:start", report_id)
+        _emit("generate:start", report_id)
+    _emit("fix:start", report_id)
     print("\n[Fixer]: Processing...")
     try:
         generated_files = None
@@ -124,20 +175,20 @@ async def run_pipeline(
         else:
             # Normal linting-based fixes
             await fix_issues_with_llm(runner_fix, session_id, report_id)
-        emit("fix:done", report_id)
+        _emit("fix:done", report_id)
     except Exception as e:
         print(f"[Fixer] Error: {e}")
         emit("fix:error", str(e))
-    emit("generate:done", report_id)
-    emit("apply:done", report_id)
+    _emit("generate:done", report_id)
+    _emit("apply:done", report_id)
 
     # After fixes, optional confidence scoring
     confidence_result = None
     if confidence_scoring:
-        emit("confidence:start")
+        _emit("confidence:start")
         try:
             confidence_result = compute_confidence(report_id, local_path)
-            emit("confidence:done", confidence_result)
+            _emit("confidence:done", confidence_result)
         except Exception as e:
             emit("confidence:error", str(e))
 
@@ -165,39 +216,42 @@ jobs:
 """
             wf_path = f"{local_path}/.github/workflows/auto-patch.yml"
             write_file(wf_path, workflow)
-            emit("ci:done", wf_path)
+            _emit("ci:done", wf_path)
         except Exception as e:
             emit("ci:error", str(e))
 
 
     # Publish
-    emit("publish:start")
+    _emit("publish:start")
     print("\n[Publisher]: Publishing...")
     import time
     timestamp = int(time.time())
     new_branch = f"auto-style-fixes-{timestamp}"
-    emit("commit:start", new_branch)
+    _emit("commit:start", new_branch)
     try:
         # Safety: ensure the repo we're about to push to matches the repo URL provided
         try:
             repo_obj = Repo(local_path)
             origin_url = (repo_obj.remotes.origin.url or "").rstrip("/").replace(".git", "")
             provided = (repo_url or "").rstrip("/").replace(".git", "")
-        except Exception:
+        except Exception as check_err:
             origin_url = None
             provided = (repo_url or "").rstrip("/").replace(".git", "")
+            print(f"[Safety] Warning: Could not verify origin: {check_err}")
 
-        if origin_url and provided and origin_url != provided:
-            err = f"Refusing to push: cloned repo origin ({origin_url}) does not match provided repo URL ({provided})"
-            print(f"[Safety] {err}")
-            emit("push:error", err)
-            return {"status": "failed", "reason": "repo_mismatch", "detail": err}
+        if origin_url and provided:
+            if origin_url != provided:
+                err = f"Refusing to push: cloned repo origin ({origin_url}) does not match provided repo URL ({provided})"
+                print(f"[Safety] ❌ CRITICAL: {err}")
+                _emit("push:error", err)
+                return {"status": "failed", "reason": "repo_mismatch", "detail": err}
+            print(f"[Safety] ✅ Verified: will push to {provided}")
 
-        created_branch = create_branch_and_push(local_path, new_branch, gh_token, files_to_add=generated_files or None, commit_message=(pr_requirement if pr_requirement else None))
-        emit("commit:done", created_branch)
-        emit("push:done", created_branch)
+        created_branch = create_branch_and_push(local_path, new_branch, gh_token, files_to_add=generated_files or None, commit_message=(pr_requirement if pr_requirement else None), expected_origin=repo_url)
+        _emit("commit:done", created_branch)
+        _emit("push:done", created_branch)
     except MergeConflictError as e:
-        emit("push:conflict", str(e))
+        _emit("push:conflict", str(e))
         # create an issue to notify the 'cloner' about the conflict
         try:
             issue_url = create_issue(repo_url, "Merge conflicts detected by AutoPatch",
@@ -206,20 +260,20 @@ jobs:
         except Exception:
             pass
         # Emit remaining stages as failed
-        emit("publish:error", str(e))
-        emit("pr:error", "Cannot create PR due to merge conflict")
-        emit("prreview:error", "Cannot review PR due to merge conflict")
+        _emit("publish:error", str(e))
+        _emit("pr:error", "Cannot create PR due to merge conflict")
+        _emit("prreview:error", "Cannot review PR due to merge conflict")
         # Still return result so UI can show what happened
         return {"status": "failed", "reason": "merge_conflict", "detail": str(e)}
     except Exception as e:
-        emit("push:error", str(e))
-        emit("publish:error", str(e))
-        emit("pr:error", str(e))
-        emit("prreview:error", str(e))
+        _emit("push:error", str(e))
+        _emit("publish:error", str(e))
+        _emit("pr:error", str(e))
+        _emit("prreview:error", str(e))
         return {"status": "failed", "reason": "push_error", "detail": str(e)}
 
     # Branch created successfully
-    emit("publish:start")
+    _emit("publish:start")
     pr_url = None
     
     # Auto-create PR (always enabled - Patcher always creates PRs)
@@ -258,11 +312,11 @@ Created by Patcher AI
             body=pr_body,
         )
         print(f"[Publisher] PR created successfully: {pr_url}")
-        emit("pr:created", pr_url)
+        _emit("pr:created", pr_url)
     except Exception as e:
         error_msg = f"Failed to create PR: {str(e)}"
         print(f"[Publisher] PR creation failed: {error_msg}")
-        emit("pr:error", error_msg)
+        _emit("pr:error", error_msg)
         pr_url = None
     
     emit("publish:done", pr_url or created_branch)
@@ -291,14 +345,27 @@ Created by Patcher AI
                 comment_body += "\n**Next Steps:**\n1. Review the changes in this PR\n2. Run your test suite to verify compatibility\n3. Merge when ready\n\n---\nCreated by Patcher AI\n"
                 post_pr_comment(pr_url, comment_body, gh_token)
                 print(f"[Patcher] Review comment posted")
-                emit("prreview:done", pr_url)
+                _emit("prreview:done", pr_url)
         except Exception as e:
             error_msg = f"Failed to post review comment: {str(e)}"
             print(f"[Patcher] PR review failed: {error_msg}")
             emit("prreview:error", error_msg)
     else:
-        emit("prreview:done", "Review not requested")
+        _emit("prreview:done", "Review not requested")
     # Return structured result for UI
     res = {"status": "ok", "branch": created_branch, "pr_url": pr_url, "bandit": bandit_report_id}
-    emit("result", res)
+    # Auto-finalize any stages that were not emitted so the UI can mark them done
+    try:
+        all_stages = [
+            "clone", "scan", "lint", "analyze", "security", "semantic", "confidence",
+            "generate", "fix", "apply", "commit", "push", "publish", "pr", "prreview", "ci",
+        ]
+        for s in all_stages:
+            done_event = f"{s}:done"
+            if done_event not in emitted_stages:
+                _emit(done_event, "auto-finalized")
+    except Exception:
+        pass
+
+    _emit("result", res)
     return res

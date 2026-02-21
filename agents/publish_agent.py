@@ -1,5 +1,79 @@
 import requests
 from core.git_utils import create_branch_and_push
+from typing import Optional
+try:
+    from core.agent_runtime import run_agent
+except Exception:
+    run_agent = None
+
+
+async def generate_pr_review_comment(
+    runner,
+    session_id: str,
+    pr_url: str,
+    repo_url: Optional[str],
+    gh_token: str,
+    max_files: int = 8,
+) -> str:
+    """Generate an AI-based PR review comment using the provided `runner`.
+
+    Falls back to a heuristic summary if no runner is available.
+    """
+    # Simple helper to fetch PR files
+    try:
+        parts = pr_url.rstrip("/").split("/")
+        pr_number = parts[-1]
+        owner_repo = "/".join(parts[-4:-2])
+    except Exception:
+        return "Automated review: could not parse PR URL to generate review."
+
+    api_url = f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}/files"
+    headers = {"Accept": "application/vnd.github+json"}
+    if gh_token:
+        headers["Authorization"] = f"token {gh_token}"
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return f"Automated review: failed to fetch PR files (status {resp.status_code})."
+        files = resp.json()
+    except Exception:
+        return "Automated review: failed to fetch PR files."
+
+    # Build a concise summary of changed files and small diffs
+    summary_lines = []
+    for f in files[:max_files]:
+        filename = f.get("filename")
+        changes = f.get("changes")
+        additions = f.get("additions")
+        deletions = f.get("deletions")
+        patch = f.get("patch") or ""
+        snippet = "".join(patch.splitlines()[:6])
+        summary_lines.append(f"- {filename}: +{additions} / -{deletions} (changes: {changes})\n{snippet}\n")
+
+    prompt = (
+        "You are an expert code reviewer. Given the list of changed files and small diffs, "
+        "produce a clear, concise review comment that: (1) summarizes the main changes, "
+        "(2) points out potential bugs or risky changes, (3) gives improvement suggestions, "
+        "and (4) provides a short acceptance checklist. Be professional and constructive.\n\n"
+        "Changed files and diffs:\n" + "\n".join(summary_lines)
+    )
+
+    # Use runner if available
+    if runner is not None and run_agent is not None:
+        try:
+            res = await run_agent(runner, session_id, prompt)
+            if res and res.strip():
+                return res
+        except Exception:
+            pass
+
+    # Fallback heuristic comment
+    comment = "Automated review by Patcher:\n\n"
+    comment += "Summary of changed files:\n"
+    comment += "\n".join([l.splitlines()[0] for l in summary_lines])
+    comment += "\n\nNotes: Please review the diffs above; consider unit tests and edge cases."
+    return comment
 
 def create_pull_request(repo_url: str, new_branch: str, base_branch: str, gh_token: str, title: str, body: str) -> str:
     # repo_url: https://github.com/owner/repo.git
