@@ -40,39 +40,76 @@ async def generate_pr_review_comment(
     except Exception:
         return "Automated review: failed to fetch PR files."
 
+    if not files:
+        return "Automated review: No files changed in this PR."
+
     # Build a concise summary of changed files and small diffs
     summary_lines = []
+    file_stats = {"added": 0, "modified": 0, "deleted": 0, "total_additions": 0, "total_deletions": 0}
+    
     for f in files[:max_files]:
-        filename = f.get("filename")
-        changes = f.get("changes")
-        additions = f.get("additions")
-        deletions = f.get("deletions")
+        filename = f.get("filename", "unknown")
+        changes = f.get("changes", 0)
+        additions = f.get("additions", 0)
+        deletions = f.get("deletions", 0)
+        status = f.get("status", "modified").lower()
+        
+        # Track file stats
+        file_stats["total_additions"] += additions
+        file_stats["total_deletions"] += deletions
+        if status == "added":
+            file_stats["added"] += 1
+        elif status == "deleted":
+            file_stats["deleted"] += 1
+        else:
+            file_stats["modified"] += 1
+        
         patch = f.get("patch") or ""
-        snippet = "".join(patch.splitlines()[:6])
-        summary_lines.append(f"- {filename}: +{additions} / -{deletions} (changes: {changes})\n{snippet}\n")
+        snippet = "\n".join(patch.splitlines()[:4]) if patch else "(no diff available)"
+        summary_lines.append(f"**{filename}** ({status}): +{additions} / -{deletions}\n```\n{snippet}\n```")
 
     prompt = (
-        "You are an expert code reviewer. Given the list of changed files and small diffs, "
-        "produce a clear, concise review comment that: (1) summarizes the main changes, "
-        "(2) points out potential bugs or risky changes, (3) gives improvement suggestions, "
-        "and (4) provides a short acceptance checklist. Be professional and constructive.\n\n"
-        "Changed files and diffs:\n" + "\n".join(summary_lines)
+        "You are an expert code reviewer. Given the list of changed files and diffs below, "
+        "produce a clear, concise review comment that:\n"
+        "1. Summarizes the main changes (2-3 sentences)\n"
+        "2. Points out any potential bugs or risky changes\n"
+        "3. Suggests improvements if applicable\n"
+        "4. Provides a brief acceptance checklist (3-4 items)\n\n"
+        "Be professional, constructive, and encouraging.\n\n"
+        "### Changed Files:\n" + "\n".join(summary_lines)
     )
 
     # Use runner if available
     if runner is not None and run_agent is not None:
         try:
             res = await run_agent(runner, session_id, prompt)
-            if res and res.strip():
+            if res and res.strip() and not res.startswith("You are an expert"):
                 return res
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Review] LLM generation failed: {e}, using fallback")
 
-    # Fallback heuristic comment
-    comment = "Automated review by Patcher:\n\n"
-    comment += "Summary of changed files:\n"
-    comment += "\n".join([l.splitlines()[0] for l in summary_lines])
-    comment += "\n\nNotes: Please review the diffs above; consider unit tests and edge cases."
+    # Fallback heuristic comment (better than before)
+    comment = "### 🤖 Patcher Automated Review\n\n"
+    comment += f"**Summary of Changes:**\n"
+    comment += f"- Files changed: {len(files)}\n"
+    comment += f"- Files added: {file_stats['added']}\n"
+    comment += f"- Files modified: {file_stats['modified']}\n"
+    comment += f"- Files deleted: {file_stats['deleted']}\n"
+    comment += f"- Total additions: +{file_stats['total_additions']}\n"
+    comment += f"- Total deletions: -{file_stats['total_deletions']}\n\n"
+    
+    comment += "**Files Changed:**\n"
+    for line in summary_lines[:max_files]:
+        first_line = line.split("\n")[0]  # Get just the filename line
+        comment += f"- {first_line}\n"
+    
+    comment += "\n**Review Checklist:**\n"
+    comment += "- [ ] Code follows project style guidelines\n"
+    comment += "- [ ] Changes are well-documented\n"
+    comment += "- [ ] Tests cover new functionality\n"
+    comment += "- [ ] No breaking changes introduced\n\n"
+    
+    comment += "---\n*This is an automated review. Please review the actual changes and test thoroughly before merging.*"
     return comment
 
 def create_pull_request(repo_url: str, new_branch: str, base_branch: str, gh_token: str, title: str, body: str) -> str:
