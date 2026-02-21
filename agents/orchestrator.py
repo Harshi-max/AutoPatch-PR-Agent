@@ -118,31 +118,38 @@ async def run_pipeline(
     runner_analyze = Runner(model="models/gemini-2.0-flash", app= "auto-patch-pr-agent", session_service=session_service)
     runner_fix = Runner(model="models/gemini-2.0-flash", app= "auto-patch-pr-agent", session_service=session_service)
 
-    # Requirement analysis (if provided)
-    if pr_review_comments:
-        try:
-            if not pr_url:
-                print("[Publisher] ❌ Cannot post PR review - no PR created")
-                _emit("prreview:error", "Cannot review PR - PR creation failed")
-            else:
-                print("[Patcher] Generating AI-based review comment...")
-                try:
-                    from agents.publish_agent import generate_pr_review_comment
-                    # prefer the analyze runner if available
-                    runner_to_use = locals().get('runner_analyze') or locals().get('runner_fix')
-                    session_id_local = session_id
-                    comment_body = await generate_pr_review_comment(runner_to_use, session_id_local, pr_url, repo_url, gh_token)
-                except Exception as gen_err:
-                    print(f"[Patcher] Review generation failed, falling back: {gen_err}")
-                    comment_body = "Automated review: could not generate AI review; please inspect changes manually."
+    # Initialize variables early to avoid "not defined" errors
+    analysis_output = ""
+    pr_url = None
+    report_id = None
+    bandit_report_id = None
+    generated_files = None
 
-                post_pr_comment(pr_url, comment_body, gh_token)
-                print(f"[Patcher] Review comment posted")
-                _emit("prreview:done", pr_url)
-        except Exception as e:
-            error_msg = f"Failed to post review comment: {str(e)}"
-            print(f"[Patcher] PR review failed: {error_msg}")
-            _emit("prreview:error", error_msg)
+    # Requirement analysis (if provided)
+    if pr_requirement:
+        _emit("requirement:start", f"Processing requirement: {pr_requirement[:60]}...")
+        print(f"\n[Requirements] User requirement: {pr_requirement}")
+        # Create an artifact entry (empty issues) so downstream stages have a valid report id
+        report_id = store_issues([], local_path)
+        analysis_output = f"Requirement: {pr_requirement}\nReference ID: {report_id}"
+        _emit("requirement:done", pr_requirement)
+    else:
+        # Normal scan / lint
+        _emit("scan:start")
+        _emit("lint:start")
+
+        # Analyze
+        _emit("analyze:start")
+        print("\n[Analyzer]: Analyzing...")
+        analysis_output = analyze_repo_for_issues(local_path)
+        print("Analysis:", analysis_output)
+        _emit("analyze:done", analysis_output)
+        _emit("lint:done", analysis_output)
+        _emit("scan:done", local_path)
+
+    # Optional security linting
+    if security_lint:
+        _emit("security:start", "Running Bandit security scan")
         try:
             bandit_report_id = run_bandit_on_path(local_path)
             _emit("security:done", bandit_report_id)
@@ -155,9 +162,7 @@ async def run_pipeline(
         sem_out = run_semantic_refactor(local_path)
         _emit("semantic:done", sem_out)
 
-    # Optional patch confidence scoring (computed after fixes)
-    # We'll compute later after fixes run
-
+    # Parse analysis output to get report ID
     match = re.search(r"([a-f0-9\-]{36})", analysis_output)
     if not match:
         # If analysis output did not include a reference ID, create a fallback empty report
@@ -176,11 +181,10 @@ async def run_pipeline(
         print(f"Artifact ID: {report_id}")
 
     # Fix / Generate code
-        _emit("generate:start", report_id)
+    _emit("generate:start", report_id)
     _emit("fix:start", report_id)
     print("\n[Fixer]: Processing...")
     try:
-        generated_files = None
         if pr_requirement:
             # Requirement-based code generation
             generated_files = await generate_code_from_requirement(runner_fix, session_id, local_path, pr_requirement)
@@ -339,29 +343,37 @@ Created by Patcher AI
         try:
             if not pr_url:
                 print("[Publisher] ❌ Cannot post PR review - no PR created")
-                emit("prreview:error", "Cannot review PR - PR creation failed")
+                _emit("prreview:error", "Cannot review PR - PR creation failed")
             else:
-                print("[Patcher] Posting automated review comment...")
-                # Dynamic review comment with requirement and generated files summary
-                comment_body = f"Automated Review by Patcher\n\n"
-                if pr_requirement:
-                    comment_body += f"**Requirement:** {pr_requirement}\n\n"
-                if 'generated_files' in locals() and generated_files:
-                    comment_body += "**Generated Files:**\n"
-                    for p in generated_files:
-                        comment_body += f"- {p}\n"
-                    comment_body += "\n"
-                comment_body += "**Summary:**\n- Code changes were auto-generated by Patcher to address the requirement.\n"
-                if bandit_report_id:
-                    comment_body += f"- Security scan complete (Bandit report: {bandit_report_id})\n"
-                comment_body += "\n**Next Steps:**\n1. Review the changes in this PR\n2. Run your test suite to verify compatibility\n3. Merge when ready\n\n---\nCreated by Patcher AI\n"
+                print("[Patcher] Generating AI-based review comment...")
+                try:
+                    from agents.publish_agent import generate_pr_review_comment
+                    # Use the analyze runner if available
+                    runner_to_use = runner_analyze if 'runner_analyze' in locals() else runner_fix
+                    comment_body = await generate_pr_review_comment(runner_to_use, session_id, pr_url, repo_url, gh_token)
+                except Exception as gen_err:
+                    print(f"[Patcher] AI review generation failed, using fallback: {gen_err}")
+                    # Fallback to heuristic comment
+                    comment_body = f"Automated Review by Patcher\n\n"
+                    if pr_requirement:
+                        comment_body += f"**Requirement:** {pr_requirement}\n\n"
+                    if generated_files:
+                        comment_body += "**Generated Files:**\n"
+                        for p in generated_files:
+                            comment_body += f"- {p}\n"
+                        comment_body += "\n"
+                    comment_body += "**Summary:**\n- Code changes were auto-generated by Patcher to address the requirement.\n"
+                    if bandit_report_id:
+                        comment_body += f"- Security scan complete (Bandit report: {bandit_report_id})\n"
+                    comment_body += "\n**Next Steps:**\n1. Review the changes in this PR\n2. Run your test suite to verify compatibility\n3. Merge when ready\n\n---\nCreated by Patcher AI\n"
+
                 post_pr_comment(pr_url, comment_body, gh_token)
                 print(f"[Patcher] Review comment posted")
                 _emit("prreview:done", pr_url)
         except Exception as e:
             error_msg = f"Failed to post review comment: {str(e)}"
             print(f"[Patcher] PR review failed: {error_msg}")
-            emit("prreview:error", error_msg)
+            _emit("prreview:error", error_msg)
     else:
         _emit("prreview:done", "Review not requested")
     # Return structured result for UI
