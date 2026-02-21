@@ -97,7 +97,19 @@ async def run_pipeline(
         pass
 
     _emit("clone:start")
-    local_path = clone_repo(repo_url, TEMP_REPOS_DIR, base_branch or None, github_token=gh_token)
+    try:
+        local_path = clone_repo(repo_url, TEMP_REPOS_DIR, base_branch or None, github_token=gh_token)
+    except RuntimeError as clone_err:
+        error_msg = str(clone_err)
+        print(f"[Pipeline] ❌ Clone failed: {error_msg}")
+        _emit("clone:error", error_msg)
+        return {"status": "failed", "reason": "clone_error", "detail": error_msg}
+    except Exception as e:
+        error_msg = f"Unexpected error during clone: {str(e)}"
+        print(f"[Pipeline] ❌ {error_msg}")
+        _emit("clone:error", error_msg)
+        return {"status": "failed", "reason": "clone_error", "detail": error_msg}
+    
     _emit("clone:done", local_path)
 
     # Initialize runners (needed for both requirement-driven and analysis-driven modes)

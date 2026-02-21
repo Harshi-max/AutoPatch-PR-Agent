@@ -22,7 +22,19 @@ def clone_repo(repo_url: str, dest_dir: str, branch: Optional[str] = None, githu
     After cloning, ensure the remote `origin` URL is set to the clean `repo_url` (without token) so
     downstream safety checks that compare origins to the provided URL succeed.
     """
-    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except PermissionError as pe:
+        raise RuntimeError(
+            f"[Clone] Permission denied: Cannot create directory {dest_dir}. "
+            f"This may happen on Streamlit Cloud due to filesystem restrictions. "
+            f"Error: {pe}"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"[Clone] Failed to create directory {dest_dir}: {e}"
+        )
+    
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     local_path = os.path.join(dest_dir, repo_name)
     # Prepare clone URL (embed token only for the clone operation)
