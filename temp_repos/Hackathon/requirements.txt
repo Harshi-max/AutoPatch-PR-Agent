@@ -1,0 +1,13 @@
+streamlit
+streamlit-folium
+folium
+twilio
+python-dotenv
+requests
+Pillow
+groq
+camel-ai
+SpeechRecognition
+pyttsx3
+geopy
+easyocr
